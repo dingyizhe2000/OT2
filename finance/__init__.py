@@ -1,0 +1,2 @@
+"""Finance data pipeline package."""
+
