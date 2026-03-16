@@ -4,3 +4,7 @@ data_finance/
 model_finance/
 data_finance/
 model_finance/
+
+# python cache
+__pycache__/
+*.py[cod]
