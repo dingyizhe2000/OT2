@@ -1,7 +1,16 @@
 import argparse
+import concurrent.futures as cf
 import json
 import math
+import os
 from pathlib import Path
+
+# Keep backend libraries single-threaded as much as possible.
+# Set before importing heavy numeric libraries.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -84,7 +93,11 @@ def build_model_from_config(cfg: dict, device: str) -> ICNN:
 
 
 def load_state_into_model(model: ICNN, ckpt_path: Path, device: str) -> None:
-    payload = torch.load(ckpt_path, map_location=device)
+    try:
+        payload = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except TypeError:
+        # Backward compatibility for older PyTorch versions without weights_only.
+        payload = torch.load(ckpt_path, map_location=device)
     if isinstance(payload, dict) and "model_state_dict" in payload:
         state_dict = payload["model_state_dict"]
     else:
@@ -116,24 +129,27 @@ def pairwise_sq_dists(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.maximum(d2, 0.0)
 
 
-def mmd_rbf_unbiased(x: np.ndarray, y: np.ndarray) -> float:
-    if x.shape[0] < 2 or y.shape[0] < 2:
-        return float("nan")
-
-    z = np.vstack([x, y])
+def estimate_rbf_sigma2(z: np.ndarray) -> float:
     d2_zz = pairwise_sq_dists(z, z)
     tri = np.triu_indices(d2_zz.shape[0], k=1)
     upper = d2_zz[tri]
     upper_pos = upper[upper > 0]
     if upper_pos.size == 0:
-        sigma2 = 1.0
-    else:
-        sigma2 = float(np.median(upper_pos))
-        if not np.isfinite(sigma2) or sigma2 <= 0:
-            sigma2 = float(np.mean(upper_pos))
-        if not np.isfinite(sigma2) or sigma2 <= 0:
-            sigma2 = 1.0
+        return 1.0
 
+    sigma2 = float(np.median(upper_pos))
+    if not np.isfinite(sigma2) or sigma2 <= 0:
+        sigma2 = float(np.mean(upper_pos))
+    if not np.isfinite(sigma2) or sigma2 <= 0:
+        sigma2 = 1.0
+    return sigma2
+
+
+def build_rbf_kernels(
+    x: np.ndarray,
+    y: np.ndarray,
+    sigma2: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     d2_xx = pairwise_sq_dists(x, x)
     d2_yy = pairwise_sq_dists(y, y)
     d2_xy = pairwise_sq_dists(x, y)
@@ -141,9 +157,15 @@ def mmd_rbf_unbiased(x: np.ndarray, y: np.ndarray) -> float:
     Kxx = np.exp(-d2_xx / (2.0 * sigma2))
     Kyy = np.exp(-d2_yy / (2.0 * sigma2))
     Kxy = np.exp(-d2_xy / (2.0 * sigma2))
+    return Kxx, Kyy, Kxy
 
-    n = x.shape[0]
-    m = y.shape[0]
+
+def mmd_unbiased_from_kernels(Kxx: np.ndarray, Kyy: np.ndarray, Kxy: np.ndarray) -> float:
+    n = Kxx.shape[0]
+    m = Kyy.shape[0]
+    if n < 2 or m < 2:
+        return float("nan")
+
     term_xx = (Kxx.sum() - np.trace(Kxx)) / (n * (n - 1))
     term_yy = (Kyy.sum() - np.trace(Kyy)) / (m * (m - 1))
     term_xy = 2.0 * Kxy.mean()
@@ -160,15 +182,8 @@ def sample_unit_directions(d: int, n_directions: int, seed: int) -> np.ndarray:
     return dirs.astype(np.float32)
 
 
-def sliced_w2_distance(
-    x: np.ndarray,
-    y: np.ndarray,
-    directions: np.ndarray,
-) -> float:
-    proj_x = x @ directions.T
-    proj_y = y @ directions.T
-
-    n_q = min(x.shape[0], y.shape[0])
+def sliced_w2_from_projections(proj_x: np.ndarray, proj_y: np.ndarray) -> float:
+    n_q = min(proj_x.shape[0], proj_y.shape[0])
     if n_q < 2:
         return float("nan")
 
@@ -179,9 +194,143 @@ def sliced_w2_distance(
     return float(np.sqrt(w2_sq_dir.mean()))
 
 
-def write_metric_csv(detail_df: pd.DataFrame, metric_col: str, avg_out: Path):
+def sliced_w2_distance(
+    x: np.ndarray,
+    y: np.ndarray,
+    directions: np.ndarray,
+) -> float:
+    proj_x = x @ directions.T
+    proj_y = y @ directions.T
+    return sliced_w2_from_projections(proj_x, proj_y)
+
+
+def split_counts(total: int, parts: int) -> list[int]:
+    if parts <= 0:
+        return []
+    q, r = divmod(total, parts)
+    return [q + (1 if i < r else 0) for i in range(parts) if (q + (1 if i < r else 0)) > 0]
+
+
+def bootstrap_mmd_chunk(
+    Kxx: np.ndarray,
+    Kyy: np.ndarray,
+    Kxy: np.ndarray,
+    n_bootstrap: int,
+    seed: int,
+) -> np.ndarray:
+    n = Kxx.shape[0]
+    m = Kyy.shape[0]
+    rng = np.random.default_rng(seed)
+    vals = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        idx_x = rng.integers(0, n, size=n)
+        idx_y = rng.integers(0, m, size=m)
+        Kxx_b = Kxx[np.ix_(idx_x, idx_x)]
+        Kyy_b = Kyy[np.ix_(idx_y, idx_y)]
+        Kxy_b = Kxy[np.ix_(idx_x, idx_y)]
+        vals[b] = mmd_unbiased_from_kernels(Kxx_b, Kyy_b, Kxy_b)
+    return vals
+
+
+def bootstrap_mmd_sd_from_kernels(
+    Kxx: np.ndarray,
+    Kyy: np.ndarray,
+    Kxy: np.ndarray,
+    n_bootstrap: int,
+    seed: int,
+    n_workers: int = 1,
+    progress_cb=None,
+) -> float:
+    n = Kxx.shape[0]
+    m = Kyy.shape[0]
+    if n < 2 or m < 2 or n_bootstrap <= 1:
+        return float("nan")
+
+    workers = max(1, min(int(n_workers), n_bootstrap))
+    counts = split_counts(n_bootstrap, workers)
+
+    if workers == 1:
+        vals = bootstrap_mmd_chunk(Kxx, Kyy, Kxy, counts[0], seed)
+        if progress_cb is not None:
+            progress_cb(counts[0])
+        return float(np.std(vals, ddof=1))
+
+    rng = np.random.default_rng(seed)
+    seeds = [int(s) for s in rng.integers(0, 2**31 - 1, size=len(counts))]
+    vals_parts = []
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut2count = {
+            ex.submit(bootstrap_mmd_chunk, Kxx, Kyy, Kxy, c, s): c
+            for c, s in zip(counts, seeds)
+        }
+        for fut in cf.as_completed(fut2count):
+            vals_parts.append(fut.result())
+            if progress_cb is not None:
+                progress_cb(fut2count[fut])
+
+    vals = np.concatenate(vals_parts, axis=0)
+    return float(np.std(vals, ddof=1))
+
+
+def bootstrap_sw2_chunk(
+    proj_x: np.ndarray,
+    proj_y: np.ndarray,
+    n_bootstrap: int,
+    seed: int,
+) -> np.ndarray:
+    n = proj_x.shape[0]
+    m = proj_y.shape[0]
+    rng = np.random.default_rng(seed)
+    vals = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        idx_x = rng.integers(0, n, size=n)
+        idx_y = rng.integers(0, m, size=m)
+        vals[b] = sliced_w2_from_projections(proj_x[idx_x], proj_y[idx_y])
+    return vals
+
+
+def bootstrap_sw2_sd_from_projections(
+    proj_x: np.ndarray,
+    proj_y: np.ndarray,
+    n_bootstrap: int,
+    seed: int,
+    n_workers: int = 1,
+    progress_cb=None,
+) -> float:
+    n = proj_x.shape[0]
+    m = proj_y.shape[0]
+    if n < 2 or m < 2 or n_bootstrap <= 1:
+        return float("nan")
+
+    workers = max(1, min(int(n_workers), n_bootstrap))
+    counts = split_counts(n_bootstrap, workers)
+
+    if workers == 1:
+        vals = bootstrap_sw2_chunk(proj_x, proj_y, counts[0], seed)
+        if progress_cb is not None:
+            progress_cb(counts[0])
+        return float(np.std(vals, ddof=1))
+
+    rng = np.random.default_rng(seed)
+    seeds = [int(s) for s in rng.integers(0, 2**31 - 1, size=len(counts))]
+    vals_parts = []
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        fut2count = {
+            ex.submit(bootstrap_sw2_chunk, proj_x, proj_y, c, s): c
+            for c, s in zip(counts, seeds)
+        }
+        for fut in cf.as_completed(fut2count):
+            vals_parts.append(fut.result())
+            if progress_cb is not None:
+                progress_cb(fut2count[fut])
+
+    vals = np.concatenate(vals_parts, axis=0)
+    return float(np.std(vals, ddof=1))
+
+
+def write_metric_csv(detail_df: pd.DataFrame, metric_cols: list[str], avg_out: Path):
     grouped = (
-        detail_df.groupby(["pair", "k", "M1"], dropna=False)[metric_col]
+        detail_df.groupby(["pair", "k", "M1"], dropna=False)[metric_cols]
         .mean()
         .reset_index()
     )
@@ -220,7 +369,7 @@ def main():
     parser.add_argument(
         "--n-directions",
         type=int,
-        default=10000,
+        default=1000,
         help="Number of random projection directions for sliced W2.",
     )
     parser.add_argument(
@@ -247,7 +396,34 @@ def main():
         default="",
         help="Optional comma-separated k values to evaluate (e.g. '-1,1').",
     )
+    parser.add_argument(
+        "--bootstrap-reps",
+        type=int,
+        default=1000,
+        help="Number of bootstrap resamples for metric standard deviations.",
+    )
+    parser.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=2026,
+        help="Random seed used for bootstrap resampling.",
+    )
+    parser.add_argument(
+        "--bootstrap-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers for bootstrap (default: 4).",
+    )
     args = parser.parse_args()
+
+    if args.bootstrap_workers < 1:
+        raise ValueError("--bootstrap-workers must be >= 1")
+
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 
     device = validate_device(args.device)
     k_filter = parse_k_values(args.k_values)
@@ -296,9 +472,10 @@ def main():
             "Check --k-values and model_finance contents."
         )
 
-    total_ckpt = sum(len(ckpts) for _, ckpts in jobs)
+    total_evals = sum(len(ckpts) * len(EVAL_PAIRS) for _, ckpts in jobs)
     rows = []
-    pbar = tqdm(total=total_ckpt, desc="Evaluating checkpoints", unit="ckpt")
+    pbar = tqdm(total=total_evals, desc="Evaluating pairs", unit="pair")
+    seed_rng = np.random.default_rng(args.bootstrap_seed)
     try:
         for cfg, ckpt_paths in jobs:
             model = build_model_from_config(cfg, device=device)
@@ -325,8 +502,44 @@ def main():
                         device=device,
                         batch_size=args.batch_size,
                     )
-                    mmd_val = mmd_rbf_unbiased(mapped, target)
-                    sw2_val = sliced_w2_distance(mapped, target, directions=directions)
+                    sigma2 = estimate_rbf_sigma2(np.vstack([mapped, target]))
+                    Kxx, Kyy, Kxy = build_rbf_kernels(mapped, target, sigma2=sigma2)
+                    proj_mapped = mapped @ directions.T
+                    proj_target = target @ directions.T
+
+                    run_desc = (
+                        f"Current run: k={k_val:g}, M1={m1_label}, "
+                        f"model={model_num}, {pair_name}"
+                    )
+                    run_total = 2 * args.bootstrap_reps if args.bootstrap_reps > 1 else 0
+                    with tqdm(
+                        total=run_total,
+                        desc=run_desc,
+                        unit="boot",
+                        leave=False,
+                        position=1,
+                        dynamic_ncols=True,
+                    ) as run_pbar:
+                        mmd_val = mmd_unbiased_from_kernels(Kxx, Kyy, Kxy)
+                        mmd_sd = bootstrap_mmd_sd_from_kernels(
+                            Kxx=Kxx,
+                            Kyy=Kyy,
+                            Kxy=Kxy,
+                            n_bootstrap=args.bootstrap_reps,
+                            seed=int(seed_rng.integers(0, 2**31 - 1)),
+                            n_workers=args.bootstrap_workers,
+                            progress_cb=run_pbar.update,
+                        )
+
+                        sw2_val = sliced_w2_from_projections(proj_mapped, proj_target)
+                        sw2_sd = bootstrap_sw2_sd_from_projections(
+                            proj_x=proj_mapped,
+                            proj_y=proj_target,
+                            n_bootstrap=args.bootstrap_reps,
+                            seed=int(seed_rng.integers(0, 2**31 - 1)),
+                            n_workers=args.bootstrap_workers,
+                            progress_cb=run_pbar.update,
+                        )
 
                     rows.append(
                         {
@@ -337,10 +550,12 @@ def main():
                             "epoch": epoch,
                             "checkpoint": str(ckpt_path),
                             "mmd_rbf": mmd_val,
+                            "mmd_rbf_bootstrap_sd": mmd_sd,
                             "sw2": sw2_val,
+                            "sw2_bootstrap_sd": sw2_sd,
                         }
                     )
-                pbar.update(1)
+                    pbar.update(1)
     finally:
         pbar.close()
 
@@ -350,12 +565,12 @@ def main():
     detail_df = pd.DataFrame(rows)
     write_metric_csv(
         detail_df=detail_df,
-        metric_col="mmd_rbf",
+        metric_cols=["mmd_rbf", "mmd_rbf_bootstrap_sd"],
         avg_out=Path(args.output_mmd_csv),
     )
     write_metric_csv(
         detail_df=detail_df,
-        metric_col="sw2",
+        metric_cols=["sw2", "sw2_bootstrap_sd"],
         avg_out=Path(args.output_sw2_csv),
     )
 

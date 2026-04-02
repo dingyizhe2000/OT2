@@ -22,7 +22,7 @@ across:
 - `dataset.py`: synthetic data generator and dataset wrapper.
 - `network.py`: ICNN architecture and helper functions.
 - `conjugate_optimization.py`: inner-loop convex conjugate optimization routines.
-- `analyze_simulation_results.ipynb`: evaluation + plotting + LaTeX-table generation notebook.
+- `analyze_results.ipynb`: evaluation + plotting + LaTeX-table generation notebook.
 - `LICENSE`: GNU GPL v3 text.
 - `Apache_LICENSE`: Apache 2.0 text for ICNN adaptation notice.
 
@@ -72,7 +72,7 @@ Example:
 Launch:
 
 ```bash
-jupyter notebook analyze_simulation_results.ipynb
+jupyter notebook analyze_results.ipynb
 ```
 
 In the notebook:
@@ -141,11 +141,21 @@ python evaluate_finance.py --device cpu
 ```
 
 This evaluation script always uses the final checkpoint for each model configuration.
+It also computes bootstrap standard deviations on transported/reference vectors
+(default `--bootstrap-reps 1000`), with sliced W2 using
+`--n-directions 1000` by default.
+Bootstrap is parallelized by default with `--bootstrap-workers 4`.
 
 Evaluate only selected `k` values (example: `k=-1` and `k=1`):
 
 ```bash
 python evaluate_finance.py --device cpu --k-values=-1,1
+```
+
+Example with custom bootstrap settings:
+
+```bash
+python evaluate_finance.py --device cpu --bootstrap-reps 500 --bootstrap-seed 2026 --bootstrap-workers 4
 ```
 
 Default training grid:
@@ -184,4 +194,6 @@ Default training grid:
   - Each model folder also includes `config.json` and `train_log.csv`.
 - Evaluation output:
   - `model_finance/evaluation/mmd_average_over_models.csv`
+    - columns include `mmd_rbf` and `mmd_rbf_bootstrap_sd`
   - `model_finance/evaluation/sw2_average_over_models.csv`
+    - columns include `sw2` and `sw2_bootstrap_sd`
