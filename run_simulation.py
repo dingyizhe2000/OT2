@@ -178,18 +178,30 @@ def build_combos(m1_values):
     scale_ks = [-1.0, 1.0, 2.0]
     model_numbers = range(100)
 
-    return [
-        {"d": d,
-         "n": n,
-         "measure": m,
-         "transform": t,
-         "k": k,
-         "m1": m1,
-         "input_index": idx}
-        for d, n, m, t, k, m1, idx in itertools.product(
-            dimensions, sample_sizes, measures, transforms, scale_ks, m1_values, model_numbers
-        )
-    ]
+    combos = []
+    for d, n, m, t, k, idx in itertools.product(
+        dimensions, sample_sizes, measures, transforms, scale_ks, model_numbers
+    ):
+        # For dual-type runs (k = -1), force M1 = infinity only.
+        # User-provided --m1_values are only applied when k > 0.
+        if k == -1.0:
+            m1_candidates = [float("inf")]
+        else:
+            m1_candidates = m1_values
+
+        for m1 in m1_candidates:
+            combos.append(
+                {
+                    "d": d,
+                    "n": n,
+                    "measure": m,
+                    "transform": t,
+                    "k": k,
+                    "m1": m1,
+                    "input_index": idx,
+                }
+            )
+    return combos
 
 def worker(hp):
     return train_each_model(**hp)

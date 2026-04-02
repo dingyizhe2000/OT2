@@ -55,16 +55,25 @@ Notes:
 
 ## Where Trained Files Are Saved
 
-`run_simulation.py` saves model checkpoints to:
+`run_simulation.py` saves model checkpoints with two path patterns:
+
+For the default case `M1 = inf`:
 
 ```text
 ../simulation_results/d=<d>/<measure>_<transform>_n_<n>_k_<k>/model_<idx>.pth
 ```
 
-Example:
+For finite `M1`:
+
+```text
+../simulation_results/d=<d>/<measure>_<transform>_n_<n>_k_<k>_M1_<M1>/model_<idx>.pth
+```
+
+Examples:
 
 ```text
 ../simulation_results/d=10/normal_CDF_n_500_k_1.0/model_17.pth
+../simulation_results/d=10/normal_CDF_n_500_k_1.0_M1_4/model_17.pth
 ```
 
 ## How to Analyze Results
