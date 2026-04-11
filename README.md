@@ -86,9 +86,19 @@ jupyter notebook analyze_results.ipynb
 
 In the notebook:
 1. Set `ROOT` / `orig_root` to your simulation output folder under `../simulation_results/...`.
-2. Run evaluation cells to compute `L2_loss` per model and write per-scenario CSV files.
-3. Run plotting cells to generate loss boxplots.
-4. Run table cells to print LaTeX summary tables.
+2. Set `TARGET_M1_VALUES` to the list of `M1` values you want to evaluate together (for example `[float("inf"), 32.0]` or `[float("inf"), 64.0, 32.0, 16.0, 8.0, 4.0]`).
+3. Run evaluation cells to compute `L2_loss` per model and write per-scenario CSV files for all selected `M1` values.
+4. Run plotting cells to generate grouped boxplots.
+5. Run table cells to print LaTeX summary tables.
+
+For the current manuscript-style setting with `M1 in {inf, 32}`, the plotting/table estimator order is:
+1. `Dual-type`
+2. `Sieve, k=2, M1=inf`
+3. `Sieve, k=1, M1=inf`
+4. `Sieve, k=2, M1=32`
+5. `Sieve, k=1, M1=32`
+
+The LaTeX table builder uses dynamic `\\multirow{...}` spans so OT-map and distribution labels remain centered when the number of estimators changes.
 
 ## License Summary
 

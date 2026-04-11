@@ -171,9 +171,9 @@ def train_each_model(d, n, measure, transform, k, m1, input_index):
 
         
 def build_combos(m1_values):
-    dimensions = [20, 10]
+    dimensions = [10]
     sample_sizes = [1000, 500, 300, 100]
-    measures = ["t", "normal"]
+    measures = ["t"]
     transforms = ["CDF", "piecewise_linear", "quadratic"]
     scale_ks = [-1.0, 1.0, 2.0]
     model_numbers = range(100)
