@@ -218,7 +218,7 @@ if __name__=="__main__":
         "--m1_values",
         type=str,
         default="inf",
-        help="Comma-separated M1 values, e.g. 'inf' or 'inf,10,20'.",
+        help="Comma-separated M1 values, e.g. 'inf' or 'inf, 32'.",
     )
     args = parser.parse_args()
 
