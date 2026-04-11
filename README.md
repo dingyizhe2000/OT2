@@ -98,8 +98,6 @@ For the current manuscript-style setting with `M1 in {inf, 32}`, the plotting/ta
 4. `Sieve, k=2, M1=32`
 5. `Sieve, k=1, M1=32`
 
-The LaTeX table builder uses dynamic `\\multirow{...}` spans so OT-map and distribution labels remain centered when the number of estimators changes.
-
 ## License Summary
 
 This repository carries two licensing contexts:
